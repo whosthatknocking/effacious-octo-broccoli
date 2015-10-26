@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# 
+# Cleanup unused Docker containers and images
+#  - Remove containers with status 'exited'
+#  - Remove containers with status 'dead'
+#  - Remove containers with exit code '-1'
+#  - Remove dangling and untagged images
+#  - Remove all images except the one that are currently being used
+#
+
+# Enable debug
+# set -o xtrace
+
+# Exit on error
+set -o errexit
+# Exit on undeclared variables
+set -o nounset
+
+set -o pipefail
+
+readonly PROGNAME=$(basename "$0")
+readonly LOCKFILE_DIR=/tmp
+readonly LOCK_FD=200
+
+# Sleep x seconds to avoid race conditions where a container has just begun
+# to use the image after an image pull"
+readonly NAP=10
+
+# Print usage
+usage()
+{
+  echo "usage: ${PROGNAME} [ --all | --containers | --dangling-images | --all-images ]"
+  exit 1
+}
+
+# Create lock
+lock()
+{
+  local FD=${2:-$LOCK_FD}
+  local LOCK_FILE=$LOCKFILE_DIR/${1}.lock
+
+  # Create lock file
+  eval "exec $FD>$LOCK_FILE"
+
+  # Acquier the lock
+  flock -n $FD \
+    && return 0 \
+    || return 1
+}
+
+timestamp()
+{
+  date +'%b %d %H:%M:%S'
+}
+
+log()
+{
+  # echo "$(timestamp) ${PROGNAME}: ${1}"
+  echo "$(timestamp) : ${1}"
+}
+
+error()
+{
+  echo "$(timestamp) : ${1}"
+  exit 1
+}
+
+# Remove containers and their volumes with status 'exited'
+status_exited_containers()
+{
+  log "Removing containers and their volumes with status 'exited'"
+  local CONTAINERS=$(docker ps -aq -f status=exited)
+  local COUNT=0
+  if [ $? -eq 0 -a "${CONTAINERS}" ]; then
+    COUNT=$(docker rm -v ${CONTAINERS} 2>/dev/null | wc -l)
+  fi
+  log "Removed ${COUNT} containers"
+}
+
+# Remove containers and their volumes with status 'dead'
+status_dead_containers()
+{
+  log "Removing containers and their volumes with status 'dead'"
+  local CONTAINERS=$(docker ps -aq -f status=dead)
+  local COUNT=0
+  if [ $? -eq 0 -a "${CONTAINERS}" ]; then
+    COUNT=$(docker rm -v ${CONTAINERS} 2>/dev/null | wc -l)
+  fi
+  log "Removed ${COUNT} containers"
+}
+
+# Remove containers and their volumes with exit status '-1'
+exited_containers()
+{
+  log "Removing containers and their volumes with exit status '-1'"
+  local CONTAINERS=$(docker ps -aq -f exited=-1)
+  local COUNT=0
+  if [ $? -eq 0 -a "${CONTAINERS}" ]; then
+    COUNT=$(docker rm -v ${CONTAINERS} 2>/dev/null | wc -l)
+  fi
+  log "Removed ${COUNT} containers"
+}
+
+# Remove dangling and untagged images
+dangling_images()
+{
+  log "Removing dangling and untagged images"
+  local IMAGES=$(docker images -f "dangling=true" -q --no-trunc)
+  local COUNT=0
+  if [ $? -eq 0 -a "${IMAGES}" ]; then
+    COUNT=$(docker rmi ${IMAGES} 2>/dev/null | grep -c "Deleted:")
+  fi
+  log "Removed ${COUNT} images"
+}
+
+# Removed all images except the one that are currently being used. Due to the
+# number of API calls this operation can be expensive.
+unused_images()
+{
+  log "Removing all images"
+  # Get all images
+  local ALL_IMAGES=$(docker images --no-trunc -q)
+
+  # Get images of running or stopped containers
+  local CONTAINERS=$(docker ps -aq --no-trunc)
+  if [ $? -eq 0 -a "${CONTAINERS}" ]; then
+    local USED_IMAGES=$(docker inspect -f '{{.Image}}' ${CONTAINERS} | sort | uniq)
+    # Get images to remove
+    local IMAGES=$(echo "${ALL_IMAGES}" | grep -v "${USED_IMAGES}")
+  else
+    local IMAGES="${ALL_IMAGES}"
+  fi
+    
+  local COUNT=0
+  if [ $? -eq 0 -a "${IMAGES}" ]; then
+    sleep ${NAP}
+    COUNT=$(docker rmi ${IMAGES} 2>/dev/null | grep -c "Deleted:")
+  fi
+  log "Removed ${COUNT} images"
+}
+
+main()
+{
+  lock ${PROGNAME} || error "Unable to create lock file, exiting!"
+
+  TEMP=`getopt -o cd --long help,containers,dangling-images,all-images,all -n "${PROGNAME}" -- "$@"`
+  eval set -- "$TEMP"
+  while true ; do
+    case "${1}" in
+      -c|--containers)
+        status_exited_containers
+        status_dead_containers
+        exited_containers
+        shift
+        ;;
+     -d|--dangling-images)
+        dangling_images
+        shift
+        ;;
+     --all-images)
+        unused_images
+        shift
+        ;;
+      --all)
+        status_exited_containers
+        status_dead_containers
+        exited_containers
+        dangling_images
+        unused_images
+        shift
+        ;;
+      --help) 
+        usage
+        ;;
+      --)
+        shift 
+        break
+        ;;
+      *) 
+        usage
+        ;;
+    esac
+  done
+}
+
+main "$@"
